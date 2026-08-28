@@ -1,0 +1,570 @@
+#include "check_compliance.h"
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <filesystem>
+#include <iostream>
+#include <stack>
+#include <string>
+#include <string_view>
+#include <variant>
+
+#include <cppparser/cppparser.h>
+
+#include "check_branching_looping.h"
+#include "check_expressions.h"
+#include "check_functionlike.h"
+#include "check_names_and_types.h"
+#include "check_variables.h"
+#include "defines.h"
+
+
+namespace contractverify
+{
+    namespace
+    {
+        // Macro arguments are parsed as text, so validate the handler name before using it
+        // to construct generated <handler>_input and <handler>_output type names.
+        bool isIdentifier(std::string_view name)
+        {
+            if (name.empty() || !(std::isalpha(static_cast<unsigned char>(name.front())) || name.front() == '_'))
+            {
+              return false;
+            }
+
+            return std::all_of(name.begin() + 1, name.end(), [](unsigned char c)
+                {
+                    return std::isalnum(c) || c == '_';
+                });
+        }
+
+        void collectPrivateInputOutputTypesFromMacro(const cppast::CppMacroCall& macro, AnalysisData& analysisData)
+        {
+            std::string macroCall = macro.macroCall();
+            // CppParser preserves formatting inside macro calls. Removing whitespace makes
+            // PRIVATE_FUNCTION ( Name ) equivalent to PRIVATE_FUNCTION(Name).
+            std::erase_if(macroCall, [](unsigned char c) { return std::isspace(c); });
+
+            static constexpr std::array privateMacroNames = {
+                "PRIVATE_FUNCTION",
+                "PRIVATE_FUNCTION_WITH_LOCALS",
+                "PRIVATE_PROCEDURE",
+                "PRIVATE_PROCEDURE_WITH_LOCALS",
+            };
+
+            for (const std::string_view macroName : privateMacroNames)
+            {
+                const std::string prefix = std::string(macroName) + '(';
+                if (macroCall.starts_with(prefix) && macroCall.ends_with(')'))
+                {
+                    const std::string functionName = macroCall.substr(prefix.length(), macroCall.length() - prefix.length() - 1);
+                    if (isIdentifier(functionName))
+                    {
+                        analysisData.privateInputOutputTypes.insert(functionName + "_input");
+                        analysisData.privateInputOutputTypes.insert(functionName + "_output");
+                    }
+                    break;
+                }
+            }
+        }
+
+        void collectPrivateInputOutputTypes(const cppast::CppCompound& compound, std::string_view stateStructName, AnalysisData& analysisData)
+        {
+            if (compound.name() == stateStructName)
+            {
+                // Only macros declared directly inside the state struct define contract handlers.
+                // Ignoring nested blocks prevents an unrelated macro call from disabling public I/O checks.
+                compound.visit<cppast::CppMacroCall>([&](const cppast::CppMacroCall& macro) -> bool
+                    {
+                        collectPrivateInputOutputTypesFromMacro(macro, analysisData);
+                        return true;
+                    });
+                return;
+            }
+
+            compound.visit<cppast::CppCompound>([&](const cppast::CppCompound& child) -> bool
+                {
+                    collectPrivateInputOutputTypes(child, stateStructName, analysisData);
+                    return true;
+                });
+        }
+
+        bool checkUsingNamespace(const cppast::CppUsingNamespaceDecl& decl, const std::string& stateStructName, AnalysisData& analysisData)
+        {
+            // in global scope, only namespace QPI is allowed
+            if (analysisData.scopeStack.empty()) // global scope
+            {
+                if (decl.name().compare("QPI") != 0)
+                {
+                    std::cout << "[ ERROR ] Only QPI can be used for a using namespace declaration in global scope." << std::endl;
+                    return false;
+                }
+            }
+
+            RETURN_IF_FALSE(isScopeResolutionAllowed(decl.name(), analysisData.additionalScopePrefixes));
+
+            return true;
+        }
+
+        bool checkUsingDecl(const cppast::CppUsingDecl& decl, const std::string& stateStructName, AnalysisData& analysisData)
+        {
+            // in global scope not allowed, otherwise ok
+
+            if (analysisData.scopeStack.empty()) // global scope
+            {
+                std::cout << "[ ERROR ] Using declaration is not allowed in global scope." << std::endl;
+                return false;
+            }
+
+            if (decl.isTemplated())
+                RETURN_IF_FALSE(checkTemplSpec(decl.templateSpecification().value(), stateStructName, analysisData));
+
+            RETURN_IF_FALSE(isScopeResolutionAllowed(decl.name(), analysisData.additionalScopePrefixes));
+
+            analysisData.scopeStack.push(ScopeSpec::USING_DECL);
+            RETURN_IF_FALSE(
+                std::visit(Overloaded{ 
+                        [&](const std::unique_ptr<cppast::CppVarType>& varType) -> bool
+                        {
+                            bool allowedAsIO = false;
+                            if (varType)
+                            {
+                                RETURN_IF_FALSE(checkVarType(*varType, stateStructName, analysisData));
+                                if (isTypeAllowedAsIO(varType->baseType(), analysisData))
+                                {
+                                    std::vector<std::string> scopedName = analysisData.scopeNames;
+                                    scopedName.push_back(decl.name());
+                                    analysisData.additionalInputOutputTypes.push_back(std::move(scopedName));
+                                    allowedAsIO = true;
+                                }
+                            }
+
+                            if (!allowedAsIO && isInputOutputType(decl.name(), analysisData))
+                            {
+                                std::cout << "[ ERROR ] " << decl.name() << " is not allowed as input/output type. The input and output structs of contract user procedures and functions may only use integer and boolean types (such as uint64, sint8, bit) as well as id, Array, and BitArray, and struct types containing only allowed types." << std::endl;
+                                return false;
+                            }
+
+                            return true;
+                        },
+                        [&](const std::unique_ptr<cppast::CppFunctionPointer>& funcPtr) -> bool
+                        {
+                            if (funcPtr)
+                            {
+                                std::cout << "[ ERROR ] Function pointers are not allowed." << std::endl;
+                                return false;
+                            }
+                            return true;
+                        },
+                        [&](const std::unique_ptr<cppast::CppCompound>& compound) -> bool
+                        {
+                            // For ease of analysis, defining a compound type as IO type via a using declaration is not allowed.
+                            if (isInputOutputType(decl.name(), analysisData))
+                            {
+                                std::cout << "[ ERROR ] " << decl.name() << " is not allowed as input/output type. For ease of analysis, defining a compound type as IO type via a using declaration is forbidden." << std::endl;
+                                return false;
+                            }
+                            if (compound)
+                            {
+                                return checkCompound(*compound, stateStructName, analysisData);
+                            }
+                            return true;
+                        }
+                    },
+                    decl.definition()
+                )
+            );
+            analysisData.scopeStack.pop();
+
+            return true;
+        }
+
+        bool checkFwdDecl(const cppast::CppForwardClassDecl& fwdDecl, const std::string& stateStructName, AnalysisData& analysisData)
+        {
+            if (fwdDecl.isTemplated())
+                RETURN_IF_FALSE(checkTemplSpec(fwdDecl.templateSpecification().value(), stateStructName, analysisData));
+            return true;
+        }
+    
+        bool checkEnum(const cppast::CppEnum& enumDecl, AnalysisData& analysisData)
+        {
+            analysisData.additionalScopePrefixes.push_back(enumDecl.name());
+
+            if (!enumDecl.name().empty() && !enumDecl.underlyingType().empty())
+            {
+                RETURN_IF_FALSE(isTypeAllowed(enumDecl.underlyingType(), analysisData.additionalScopePrefixes));
+
+                if (isTypeAllowedAsIO(enumDecl.underlyingType(), analysisData))
+                {
+                    std::vector<std::string> scopedName = analysisData.scopeNames;
+                    scopedName.push_back(enumDecl.name());
+                    analysisData.additionalInputOutputTypes.push_back(std::move(scopedName));
+                }
+            }
+
+            return true;
+        }
+
+    }  // namespace
+
+    bool checkCompound(const cppast::CppCompound& compound, const std::string& stateStructName, AnalysisData& analysisData)
+    {
+        if (IsNamespaceLike(compound))
+        {
+            if (compound.compoundType() == cppast::CppCompoundType::UNION)
+            {
+                std::cout << "[ ERROR ] `union` is not allowed." << std::endl;
+                return false;
+            }
+            if (compound.isTemplated())
+            {
+                checkTemplSpec(compound.templateSpecification().value(), stateStructName, analysisData);
+            }
+            RETURN_IF_FALSE(isNameAllowed(compound.name(), analysisData.additionalScopePrefixes));
+        }
+        if (!compound.inheritanceList().empty())
+        {
+            for (const auto& inheritanceInfo : compound.inheritanceList())
+            {
+                RETURN_IF_FALSE(isInheritanceAllowed(inheritanceInfo.baseName, analysisData.additionalScopePrefixes));
+            }
+        }
+
+        bool scopeStackPushed = true;
+        bool scopeNamesPushed = false;
+        bool allowedAsIOPushed = false;
+        switch (compound.compoundType())
+        {
+        case cppast::CppCompoundType::STRUCT:
+            if (analysisData.scopeStack.empty()) // global struct name has to start with stateStructName  
+                RETURN_IF_FALSE(hasStateStructPrefix(compound.name(), stateStructName));
+            analysisData.additionalScopePrefixes.push_back(compound.name());
+            analysisData.scopeStack.push(ScopeSpec::STRUCT);
+            analysisData.scopeNames.push_back(compound.name());
+            scopeNamesPushed = true;
+            analysisData.allowedAsIOStruct.push(true);
+            allowedAsIOPushed = true;
+            break;
+        case cppast::CppCompoundType::CLASS:
+            if (analysisData.scopeStack.empty()) // global class name has to start with stateStructName
+                RETURN_IF_FALSE(hasStateStructPrefix(compound.name(), stateStructName));
+            analysisData.additionalScopePrefixes.push_back(compound.name());
+            analysisData.scopeStack.push(ScopeSpec::CLASS);
+            analysisData.scopeNames.push_back(compound.name());
+            scopeNamesPushed = true;
+            analysisData.allowedAsIOStruct.push(true);
+            allowedAsIOPushed = true;
+            break;
+        case cppast::CppCompoundType::NAMESPACE:
+            analysisData.scopeStack.push(ScopeSpec::NAMESPACE);
+            analysisData.scopeNames.push_back(compound.name());
+            scopeNamesPushed = true;
+            break;
+        case cppast::CppCompoundType::BLOCK:
+        case cppast::CppCompoundType::EXTERN_C_BLOCK:
+            analysisData.scopeStack.push(ScopeSpec::BLOCK);
+            break;
+        default:
+            scopeStackPushed = false;
+            break;
+        }
+
+        if (!compound.visitAll([&](const cppast::CppEntity& ent) -> bool { return checkEntity(ent, stateStructName, analysisData); }))
+            return false;
+
+        if (allowedAsIOPushed)
+        {
+            if (analysisData.allowedAsIOStruct.top())
+            {
+                // add fully scoped struct/class name to the list of additional allowed input/output types
+                analysisData.additionalInputOutputTypes.push_back(analysisData.scopeNames);
+            }
+            else
+            {
+                // analyzed struct/class is not allowed as input/output type
+                if (isInputOutputType(compound.name(), analysisData))
+                {
+                    std::string name = compound.name();
+                    if (name.empty())
+                        name = "unnamed struct";
+                    std::cout << "[ ERROR ] " << name << " is not allowed as input/output type. The input and output structs of contract user procedures and functions may only use integer and boolean types (such as uint64, sint8, bit) as well as id, Array, and BitArray, and struct types containing only allowed types." << std::endl;
+                    return false;
+                }
+            }
+            analysisData.allowedAsIOStruct.pop();
+        }
+        if (scopeStackPushed)
+            analysisData.scopeStack.pop();
+        if (scopeNamesPushed)
+            analysisData.scopeNames.pop_back();
+
+        return true;
+    }
+
+    bool checkEntity(const cppast::CppEntity& entity, const std::string& stateStructName, AnalysisData& analysisData)
+    {
+        switch (entity.entityType())
+        {
+        case cppast::CppEntityType::DOCUMENTATION_COMMENT:
+            return true;
+
+        case cppast::CppEntityType::ENTITY_ACCESS_SPECIFIER:
+            // public, protected, private
+            return true;
+
+        case cppast::CppEntityType::ENUM:
+            return checkEnum(static_cast<const cppast::CppEnum&>(entity), analysisData);
+
+        case cppast::CppEntityType::MACRO_CALL:
+            // macro arguments? but we are anyways restricted to the known macros
+            return true;
+
+        case cppast::CppEntityType::LABEL:
+            return true;
+
+        case cppast::CppEntityType::PREPROCESSOR:
+            std::cout << "[ ERROR ] Preprocessor directives (character `#`) are not allowed." << std::endl;
+            return false;
+
+        case cppast::CppEntityType::NAMESPACE_ALIAS:
+            std::cout << "[ ERROR ] Namespace alias is not allowed." << std::endl;
+            return false;
+
+        case cppast::CppEntityType::TYPEDEF_DECL_LIST:
+            std::cout << "[ ERROR ] Typedef lists are not allowed. Use separate typedefs instead." << std::endl;
+            return false;
+
+        case cppast::CppEntityType::FUNCTION_PTR:
+            std::cout << "[ ERROR ] Function pointers are not allowed." << std::endl;
+            return false;
+
+        case cppast::CppEntityType::CONSTRUCTOR:
+            std::cout << "[ ERROR ] Constructors are not allowed." << std::endl;
+            return false;
+
+        case cppast::CppEntityType::DESTRUCTOR:
+            std::cout << "[ ERROR ] Destructors are not allowed." << std::endl;
+            return false;
+
+        case cppast::CppEntityType::THROW_STATEMENT:
+            std::cout << "[ ERROR ] `throw` statement is not allowed." << std::endl;
+            return false;
+
+        case cppast::CppEntityType::TRY_BLOCK:
+            std::cout << "[ ERROR ] `try` blocks are not allowed." << std::endl;
+            return false;
+
+        case cppast::CppEntityType::BLOB:
+            // not quite sure how something becomes a blob but we cannot do the analysis with it
+            std::cout << "[ ERROR ] CppEntity of type BLOB cannot be analyzed." << std::endl;
+            return false;
+
+        case cppast::CppEntityType::COMPOUND:
+            return checkCompound(static_cast<const cppast::CppCompound&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::VAR:
+            return checkVar(static_cast<const cppast::CppVar&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::VAR_LIST:
+            return checkVarList(static_cast<const cppast::CppVarList&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::USING_NAMESPACE:
+            return checkUsingNamespace(static_cast<const cppast::CppUsingNamespaceDecl&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::USING_DECL:
+            return checkUsingDecl(static_cast<const cppast::CppUsingDecl&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::TYPEDEF_DECL:
+            return checkTypedef(static_cast<const cppast::CppTypedefName&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::GOTO_STATEMENT:
+            return checkGotoStatement(static_cast<const cppast::CppGotoStatement&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::FORWARD_CLASS_DECL:
+            return checkFwdDecl(static_cast<const cppast::CppForwardClassDecl&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::TYPE_CONVERTER:
+            return checkTypeConverter(static_cast<const cppast::CppTypeConverter&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::FUNCTION:
+            return checkFunction(static_cast<const cppast::CppFunction&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::LAMBDA:
+            return checkLambda(static_cast<const cppast::CppLambda&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::EXPRESSION:
+            return checkExpr(static_cast<const cppast::CppExpression&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::RETURN_STATEMENT:
+            return checkReturn(static_cast<const cppast::CppReturnStatement&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::IF_BLOCK:
+            return checkIfBlock(static_cast<const cppast::CppIfBlock&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::FOR_BLOCK:
+            return checkForBlock(static_cast<const cppast::CppForBlock&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::RANGE_FOR_BLOCK:
+            return checkRangeForBlock(static_cast<const cppast::CppRangeForBlock&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::WHILE_BLOCK:
+            return checkWhileBlock(static_cast<const cppast::CppWhileBlock&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::DO_WHILE_BLOCK:
+            return checkDoWhileBlock(static_cast<const cppast::CppDoWhileBlock&>(entity), stateStructName, analysisData);
+
+        case cppast::CppEntityType::SWITCH_BLOCK:
+            return checkSwitchBlock(static_cast<const cppast::CppSwitchBlock&>(entity), stateStructName, analysisData);
+
+        default:
+            // control should never reach here
+            std::cout << "[ ERROR ] Unknown CppEntityType encountered while analyzing the AST: " << static_cast<int>(entity.entityType()) << std::endl;
+            return false;
+        }
+    }
+
+    bool checkCompliance(const cppast::CppCompound& compound, const std::string& stateStructName, FileType fileType)
+    {
+        AnalysisData analysisData;
+        analysisData.fileType = fileType;
+        if (fileType == FileType::CONTRACT)
+        {
+            // Input/output types are usually declared before their PRIVATE_* handler macro.
+            // Collect private handler names first so the main traversal knows their visibility.
+            collectPrivateInputOutputTypes(compound, stateStructName, analysisData);
+        }
+        return checkEntity(compound, stateStructName, analysisData);
+    }
+
+    bool checkCompliance(const cppast::CppCompound& compound, FileType fileType)
+    {
+        std::string stateStructName;
+        if (fileType == FileType::CONTRACT)
+        {
+            stateStructName = findStateStructName(compound);
+        }
+        else if (fileType == FileType::ORACLE_INTERFACE)
+        {
+            stateStructName = findOracleInterfaceStructNameAndCheckTopLevel(compound);
+        }
+        if (stateStructName.empty())
+            return false;
+        return checkCompliance(compound, stateStructName, fileType);
+    }
+
+    std::unique_ptr<cppast::CppCompound> parseAST(const std::string& filepath)
+    {
+        // Check that file exists because CppParser does not have a check
+        if (!std::filesystem::exists(filepath))
+        {
+            std::cout << "[ ERROR ] File does not exist: " << filepath << "." << std::endl;
+            return nullptr;
+        }
+        cppparser::CppParser parser;
+        parser.addKnownMacros(knownMacroNames);
+        return parser.parseFile(filepath.c_str());
+    }
+
+    std::string findStateStructName(const cppast::CppCompound& ast)
+    {
+        // Assumption: state struct is the first top-level struct that inherits from ContractBase
+        std::string name = "";
+
+        if (ast.compoundType() != cppast::CppCompoundType::FILE)
+        {
+            std::cout << "[ ERROR ] Need a top-level CppCompound (compound type FILE) for finding the state struct name." << std::endl;
+            return name;
+        }
+
+        // `visitAll` visits the entities sequentially, so we do not need any lock for `name`
+        ast.visitAll([&](const cppast::CppEntity& entity) -> bool
+            {
+                if (name.empty() && entity.entityType() == cppast::CppEntityType::COMPOUND)
+                {
+                    const auto& compound = static_cast<const cppast::CppCompound&>(entity);
+                    if (compound.compoundType() == cppast::CppCompoundType::STRUCT)
+                    {
+                        for (const auto& baseClass : compound.inheritanceList())
+                        {
+                            if (baseClass.baseName.compare("ContractBase") == 0)
+                            {
+                                name = compound.name();
+                                return true;
+                            }
+                        }
+                    }
+                }
+                // need to return true in any case because `visitAll` interrupts when the callback returns false on an entity
+                return true;
+            }
+        );
+
+        if (name.empty())
+            std::cout << "[ ERROR ] The contract must contain a global-scope struct that is derived from ContractBase." << std::endl;
+
+        return name;
+    }
+
+    std::string findOracleInterfaceStructNameAndCheckTopLevel(const cppast::CppCompound& ast)
+    {
+        std::string name = "";
+        unsigned int numStructs = 0;
+        bool foundForbiddenEntities = false;
+
+        if (ast.compoundType() != cppast::CppCompoundType::FILE)
+        {
+            std::cout << "[ ERROR ] Need a top-level CppCompound (compound type FILE) for finding the oracle interface struct name." << std::endl;
+            return name;
+        }
+
+        // `visitAll` visits the entities sequentially, so we do not need any lock for `name` and others
+        ast.visitAll([&](const cppast::CppEntity& entity) -> bool
+            {
+                switch (entity.entityType())
+                {
+                case cppast::CppEntityType::COMPOUND:
+                {
+                    const auto& compound = static_cast<const cppast::CppCompound&>(entity);
+                    if (compound.compoundType() == cppast::CppCompoundType::STRUCT || compound.compoundType() == cppast::CppCompoundType::CLASS)
+                    {
+                        // one struct or class is allowed
+                        name = compound.name();
+                        ++numStructs;
+                        return true;
+                    }
+                }
+
+                case cppast::CppEntityType::DOCUMENTATION_COMMENT:
+                case cppast::CppEntityType::USING_NAMESPACE:
+                    // allowed
+                    return true;
+
+                case cppast::CppEntityType::USING_DECL:
+                case cppast::CppEntityType::TYPEDEF_DECL:
+                case cppast::CppEntityType::TYPEDEF_DECL_LIST:
+                case cppast::CppEntityType::FUNCTION_PTR:
+                case cppast::CppEntityType::NAMESPACE_ALIAS:
+                case cppast::CppEntityType::PREPROCESSOR:
+                    // forbidden but checked later -> allow for now to print more specific error message
+                    return true;
+                }
+
+                foundForbiddenEntities = true;
+
+                // need to return true in any case because `visitAll` interrupts when the callback returns false on an entity
+                return true;
+            }
+        );
+
+        if (numStructs != 1 || foundForbiddenEntities)
+        {
+            std::cout << "[ ERROR ] The oracle interface must contain exactly one struct definition. Other definition/declarations are forbidden." << std::endl;
+            name = "";
+        }
+
+        return name;
+    }
+
+}  // namespace contractverify
+

@@ -1,0 +1,19 @@
+name: Test contract verify action
+
+on: [push]
+
+jobs:
+  test_contract_verify_job:
+    runs-on: ubuntu-latest
+    steps:
+      # To use this repository's private action,
+      # you must check out the repository
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+      - name: Contract verify action step
+        uses: ./ # Uses an action in the root directory
+        id: verify
+        with:
+          filepaths: 'test/testfiles/test_ok_function.h,test/testfiles/test_ok_lambda.h'
