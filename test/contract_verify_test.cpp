@@ -84,6 +84,14 @@ namespace contractverify
     SuccessTestInfo successContractTestInfos[] =
     {
         {
+            "test_ok_multi_vote_io.h",
+            "MultiVoteInputOutput"
+        },
+        {
+            "test_ok_shareholder_hooks.h",
+            "ShareholderHooks"
+        },
+        {
             "test_ok_function_call.h",
             "FunctionCall"
         },
@@ -468,6 +476,11 @@ namespace contractverify
             "test_fail_local_variable.h",
             "[ ERROR ] Local variables are not allowed, found variable with name fee.\n",
             "LocalVariable"
+        },
+        {
+            "test_fail_shareholder_hook_local_variable.h",
+            "[ ERROR ] Local variables are not allowed, found variable with name fee.\n",
+            "ShareholderHookLocalVariable"
         },
         {
             "test_fail_scope_resolution_function_call.h",
